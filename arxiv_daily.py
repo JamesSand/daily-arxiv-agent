@@ -179,13 +179,34 @@ def llm_translate(abstract):
         return None
 
 
+def llm_authors(arxiv_id, fallback):
+    """从 arXiv HTML 首页用 LLM 抽取『作者（机构）』；失败回退到 arXiv 作者名。"""
+    try:
+        html = _get(f"https://arxiv.org/html/{arxiv_id}").decode("utf-8", "ignore")
+        t = re.sub(r"<(script|style).*?</\1>", " ", html, flags=re.S)
+        t = re.sub(r"<[^>]+>", " ", t)
+        t = re.sub(r"\s+", " ", t).strip()[:5000]
+        out = _llm_text(
+            "下面是一篇 arXiv 论文首页的文本。只提取所有作者及其所属机构，用中文按『作者（机构）』格式、"
+            "逗号分隔列在一行；某作者机构缺失就只写其姓名。不要输出论文标题、不要解释、不要任何多余内容：\n\n" + t,
+            max_tokens=300)
+        if out and out.strip():
+            return out.strip()
+    except Exception as e:
+        print(f"[warn] authors extract failed ({arxiv_id}): {e}", file=sys.stderr)
+    return ", ".join(fallback) if fallback else ""
+
+
 def render(scored, top, seed_desc):
     import time
     L = [f"# arxiv daily paper · {time.strftime('%Y-%m-%d')}", "_按相关度排序_\n"]
     for i, (score, c) in enumerate(scored[:top], 1):
         zh = llm_translate(c["abstract"])
+        authors = llm_authors(c["id"], c.get("authors"))
         L.append(f"### {i}. {c['title']}")
         L.append(f"_{c['date']} · {c['cat']} · 相关度 {score:.3f}_")
+        if authors:
+            L.append(f"**作者**：{authors}")
         L.append(f"— [{c['id']} (pdf)]({c['link']})")
         L.append("")
         if zh:
