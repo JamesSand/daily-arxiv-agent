@@ -106,33 +106,106 @@ def tokenize(t):
     return [w for w in re.findall(r"[a-z][a-z\-]{2,}", (t or "").lower()) if w not in STOP]
 
 
-def rank(seed, candidates):
-    if not seed.strip():
+def rank(seed, candidates, liked_texts=None, disliked_texts=None, alpha=1.0, beta=0.8, gamma=0.6):
+    """Rocchio 相关性反馈：q = α·种子 + β·均值(👍) − γ·均值(👎)，按 cos(候选, q) 排序。"""
+    liked_texts = liked_texts or []
+    disliked_texts = disliked_texts or []
+    cand_docs = [tokenize(c["title"] + " " + c["abstract"]) for c in candidates]
+    seed_doc = tokenize(seed)
+    liked_docs = [tokenize(t) for t in liked_texts]
+    disliked_docs = [tokenize(t) for t in disliked_texts]
+    corpus = [seed_doc] + cand_docs + liked_docs + disliked_docs
+    if not any(corpus):
         return [(0.0, c) for c in candidates]
-    docs = [tokenize(seed)] + [tokenize(c["title"] + " " + c["abstract"]) for c in candidates]
     df = Counter()
-    for d in docs:
+    for d in corpus:
         for w in set(d):
             df[w] += 1
-    N = len(docs)
+    N = max(1, len(corpus))
     idf = {w: math.log(N / (1 + c)) + 1 for w, c in df.items()}
 
     def vec(toks):
+        if not toks:
+            return {}
         tf = Counter(toks)
-        return {w: (f / len(toks)) * idf[w] for w, f in tf.items()} if toks else {}
+        return {w: (f / len(toks)) * idf.get(w, 0.0) for w, f in tf.items()}
+
+    def centroid(vs):
+        vs = [v for v in vs if v]
+        if not vs:
+            return {}
+        c = {}
+        for v in vs:
+            for w, x in v.items():
+                c[w] = c.get(w, 0.0) + x
+        return {w: x / len(vs) for w, x in c.items()}
 
     def cos(a, b):
         if not a or not b:
             return 0.0
-        dot = sum(a[w] * b.get(w, 0) for w in a)
-        na = math.sqrt(sum(v * v for v in a.values()))
-        nb = math.sqrt(sum(v * v for v in b.values()))
+        dot = sum(x * b.get(w, 0.0) for w, x in a.items())
+        na = math.sqrt(sum(x * x for x in a.values()))
+        nb = math.sqrt(sum(x * x for x in b.values()))
         return dot / (na * nb) if na and nb else 0.0
 
-    sv = vec(docs[0])
-    scored = [(cos(sv, vec(docs[i + 1])), candidates[i]) for i in range(len(candidates))]
+    def unit(v):
+        n = math.sqrt(sum(x * x for x in v.values()))
+        return {w: x / n for w, x in v.items()} if n else {}
+
+    def add(q, v, weight):
+        for w, x in v.items():
+            q[w] = q.get(w, 0.0) + weight * x
+
+    # 每部分先单位化再加权：否则 27 篇拼成的巨型种子、或单篇的稀有词会主导方向
+    q = {}
+    add(q, unit(vec(seed_doc)), alpha)
+    add(q, unit(centroid([unit(vec(d)) for d in liked_docs])), beta)
+    add(q, unit(centroid([unit(vec(d)) for d in disliked_docs])), -gamma)
+    scored = [(cos(q, vec(cand_docs[i])), candidates[i]) for i in range(len(candidates))]
     scored.sort(key=lambda x: x[0], reverse=True)
     return scored
+
+
+def load_feedback(path):
+    """读 feedback.jsonl（每行 {id, vote: up|down, ts}）。同一篇取最新一票。"""
+    latest = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    o = json.loads(line)
+                except Exception:
+                    continue
+                bid = re.sub(r"v\d+$", "", o.get("id", ""))
+                if bid and o.get("vote") in ("up", "down"):
+                    latest[bid] = (o["vote"], o.get("id", bid))
+    except FileNotFoundError:
+        pass
+    liked = {i for v, i in latest.values() if v == "up"}
+    disliked = {i for v, i in latest.values() if v == "down"}
+    return liked, disliked, set(latest.keys())
+
+
+def fetch_by_ids(ids):
+    """按 arXiv id 批量取 title+abstract（给已投票论文做向量）。"""
+    ids = [i for i in ids if i]
+    out = {}
+    for j in range(0, len(ids), 50):
+        chunk = ids[j:j + 50]
+        url = f"http://export.arxiv.org/api/query?id_list={','.join(chunk)}&max_results={len(chunk)}"
+        try:
+            root = ET.fromstring(_get(url))
+        except Exception as e:
+            print(f"[warn] fetch_by_ids failed: {e}", file=sys.stderr)
+            continue
+        for e in root.findall("a:entry", NS):
+            title = re.sub(r"\s+", " ", (e.findtext("a:title", "", NS) or "").strip())
+            summ = re.sub(r"\s+", " ", (e.findtext("a:summary", "", NS) or "").strip())
+            out[(e.findtext("a:id", "", NS) or "").rsplit("/", 1)[-1]] = f"{title} {summ}"
+    return out
 
 
 def _translate_prompt(abstract):
@@ -241,6 +314,81 @@ def send_email(subject, html_or_text):
     return True
 
 
+def _tg(method, payload, tok):
+    req = urllib.request.Request(f"https://api.telegram.org/bot{tok}/{method}",
+                                 data=json.dumps(payload).encode(),
+                                 headers={"Content-Type": "application/json"})
+    return json.loads(urllib.request.urlopen(req, timeout=30).read())
+
+
+def telegram_ingest(tok, fb_path, offset_path):
+    """把 getUpdates 里的 👍/👎 按钮点击写进 feedback.jsonl，并推进 offset。"""
+    off = 0
+    try:
+        off = int(open(offset_path).read().strip())
+    except Exception:
+        pass
+    try:
+        d = _tg("getUpdates", {"offset": off, "timeout": 0, "allowed_updates": ["callback_query"]}, tok)
+    except Exception as e:
+        print(f"[warn] tg getUpdates: {e}", file=sys.stderr)
+        return 0
+    n, last = 0, off
+    with open(fb_path, "a") as fb:
+        for u in d.get("result", []):
+            last = max(last, u["update_id"] + 1)
+            cq = u.get("callback_query")
+            if not cq:
+                continue
+            v, _, pid = cq.get("data", "").partition(":")
+            vote = {"up": "up", "dn": "down"}.get(v)
+            if vote and pid:
+                fb.write(json.dumps({"id": pid, "vote": vote}) + "\n")
+                n += 1
+                try:
+                    _tg("answerCallbackQuery", {"callback_query_id": cq["id"],
+                        "text": "👍 已记录，会多推这类" if vote == "up" else "👎 已记录，会少推这类"}, tok)
+                except Exception:
+                    pass
+    if last != off:
+        open(offset_path, "w").write(str(last))
+    if n:
+        print(f"[info] ingested {n} telegram votes", file=sys.stderr)
+    return n
+
+
+def telegram_send(tok, chat_id, scored, top):
+    import time
+    try:
+        _tg("sendMessage", {"chat_id": chat_id,
+            "text": f"📚 arxiv daily paper · {time.strftime('%Y-%m-%d')} · 共 {min(top, len(scored))} 篇（点 👍/👎 调教推荐）"}, tok)
+    except Exception as e:
+        print(f"[warn] tg head: {e}", file=sys.stderr)
+    sent = 0
+    for i, (score, c) in enumerate(scored[:top], 1):
+        zh = llm_translate(c["abstract"])
+        authors = llm_authors(c["id"], c.get("authors"))
+        parts = [f"{i}. {c['title']}", f"{c['date']} · {c['cat']} · 相关度 {score:.3f}"]
+        if authors:
+            parts.append(f"作者：{authors}")
+        parts.append(c["link"])
+        if zh:
+            parts.append(f"\n【中文】\n{zh}")
+        parts.append(f"\n【English】\n{c['abstract']}")
+        text = "\n".join(parts)
+        if len(text) > 4000:
+            text = text[:3980] + " …"
+        kb = {"inline_keyboard": [[{"text": "👍 喜欢", "callback_data": f"up:{c['id']}"},
+                                   {"text": "👎 不要", "callback_data": f"dn:{c['id']}"}]]}
+        try:
+            _tg("sendMessage", {"chat_id": chat_id, "text": text, "reply_markup": kb,
+                                "disable_web_page_preview": True}, tok)
+            sent += 1
+        except Exception as e:
+            print(f"[warn] tg send {c['id']}: {e}", file=sys.stderr)
+    return sent
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--seed-author", default=os.environ.get("SEED_AUTHOR"))
@@ -250,23 +398,41 @@ def main():
     ap.add_argument("--pool", type=int, default=200)
     ap.add_argument("--top", type=int, default=int(os.environ.get("PAPERS_PER_DAY", "15")))
     ap.add_argument("-o", "--out", default=None)
+    ap.add_argument("--feedback", default=os.environ.get("FEEDBACK_FILE"))
     a = ap.parse_args()
 
     cats = [c for c in a.cats.split(",") if c]
     seed = seed_text(a.seed_author, a.notes, a.keywords)
     seed_desc = a.seed_author or a.notes or (a.keywords or "")[:50]
+    here = os.path.dirname(os.path.abspath(__file__))
+    fb_path = a.feedback or os.path.join(here, "feedback.jsonl")
+    tok = os.environ.get("TELEGRAM_BOT_TOKEN")
+    chat = os.environ.get("TELEGRAM_CHAT_ID")
+    if tok:
+        telegram_ingest(tok, fb_path, os.path.join(here, "tg_offset.txt"))  # 先收上一轮的 👍/👎
     cands = fetch_candidates(cats, a.pool)
     print(f"[info] fetched {len(cands)} candidates from {cats}", file=sys.stderr)
-    scored = rank(seed, cands)
-    md = render(scored, a.top, seed_desc)
+    liked_ids, disliked_ids, voted_bases = load_feedback(fb_path)
+    if voted_bases:
+        cands = [c for c in cands if re.sub(r"v\d+$", "", c["id"]) not in voted_bases]
+        print(f"[info] feedback 👍{len(liked_ids)} 👎{len(disliked_ids)}; {len(cands)} left after excluding voted", file=sys.stderr)
+    liked_texts = list(fetch_by_ids(liked_ids).values())
+    disliked_texts = list(fetch_by_ids(disliked_ids).values())
+    scored = rank(seed, cands, liked_texts, disliked_texts)
 
-    if send_email("arxiv daily paper", md):
-        print("[ok] emailed digest")
-    if a.out:
-        open(a.out, "w").write(md)
-        print(f"[ok] written: {a.out}")
-    elif not os.environ.get("SMTP_SENDER_EMAIL"):
-        print(md)
+    delivered = False
+    if tok and chat:
+        print(f"[ok] telegram sent {telegram_send(tok, chat, scored, a.top)}")
+        delivered = True
+    if not delivered:
+        md = render(scored, a.top, seed_desc)
+        if send_email("arxiv daily paper", md):
+            print("[ok] emailed digest")
+        if a.out:
+            open(a.out, "w").write(md)
+            print(f"[ok] written: {a.out}")
+        elif not os.environ.get("SMTP_SENDER_EMAIL"):
+            print(md)
 
 
 if __name__ == "__main__":

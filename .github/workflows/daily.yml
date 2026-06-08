@@ -2,37 +2,38 @@ name: daily-arxiv-digest
 
 on:
   schedule:
-    # 08:00 America/Los_Angeles. GitHub cron is UTC; 15:00 UTC = 08:00 PDT (夏令时).
-    # 冬令时(PST, UTC-8)时这会变成 07:00 本地——届时把 15 改成 16 即可。
+    # 08:00 America/Los_Angeles。GitHub cron 用 UTC；15:00 UTC = 08:00 PDT(夏令时)。
+    # 冬令时(PST, UTC-8)时改成 "0 16 * * *"。
     - cron: "0 15 * * *"
-  workflow_dispatch: {}   # 允许手动触发测试
+  workflow_dispatch: {}   # 手动触发
+
+permissions:
+  contents: write          # 需要把 feedback.jsonl / tg_offset.txt commit 回来
 
 jobs:
   digest:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - run: pip install -r requirements.txt
-      - name: Generate & email digest
+      - name: Ingest 👍/👎 + rank + send to Telegram
         env:
           LLM_PROVIDER: ${{ secrets.LLM_PROVIDER }}
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
           LLM_MODEL: claude-opus-4-8
-          SEED_AUTHOR: ${{ secrets.SEED_AUTHOR }}   # 种子作者放 secret，不写进仓库（日志里会打码）
-          SMTP_SENDER_EMAIL: ${{ secrets.SMTP_SENDER_EMAIL }}
-          SMTP_APP_PASSWORD: ${{ secrets.SMTP_APP_PASSWORD }}
-          DIGEST_RECIPIENT: ${{ secrets.DIGEST_RECIPIENT }}
+          SEED_AUTHOR: ${{ secrets.SEED_AUTHOR }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          python arxiv_daily.py \
-            --cats cs.CL,cs.LG,cs.AI \
-            --pool 250 --top 12 \
-            -o digest-latest.md
-      - uses: actions/upload-artifact@v4
-        with:
-          name: digest
-          path: digest-latest.md
-          if-no-files-found: warn
+          python arxiv_daily.py --cats cs.CL,cs.LG,cs.AI --pool 250 --top 12
+      - name: Persist feedback state
+        run: |
+          git config user.name "JamesSand"
+          git config user.email "zhizhousha@together.ai"
+          touch feedback.jsonl tg_offset.txt
+          git add feedback.jsonl tg_offset.txt
+          git diff --cached --quiet || (git commit -m "update feedback state [skip ci]" && git push)
