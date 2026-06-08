@@ -2,9 +2,9 @@ name: daily-arxiv-digest
 
 on:
   schedule:
-    # 08:00 America/Los_Angeles。GitHub cron 用 UTC；15:00 UTC = 08:00 PDT(夏令时)。
-    # 冬令时(PST, UTC-8)时改成 "0 16 * * *"。
-    - cron: "0 15 * * *"
+    # 周一到周五 08:00 America/Los_Angeles。cron 用 UTC；15:00 UTC = 08:00 PDT(夏令时)。
+    # 1-5 = Mon–Fri。冬令时(PST, UTC-8)时改成 "0 16 * * 1-5"。
+    - cron: "0 15 * * 1-5"
   workflow_dispatch: {}   # 手动触发
 
 permissions:
@@ -28,6 +28,9 @@ jobs:
           SEED_AUTHOR: ${{ secrets.SEED_AUTHOR }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SMTP_SENDER_EMAIL: ${{ secrets.SMTP_SENDER_EMAIL }}
+          SMTP_APP_PASSWORD: ${{ secrets.SMTP_APP_PASSWORD }}
+          DIGEST_RECIPIENT: ${{ secrets.DIGEST_RECIPIENT }}
         run: |
           python arxiv_daily.py --cats cs.CL,cs.LG,cs.AI --pool 250 --top 12
       - name: Persist feedback state

@@ -270,26 +270,22 @@ def llm_authors(arxiv_id, fallback):
     return ", ".join(fallback) if fallback else ""
 
 
-def render(scored, top, seed_desc):
+def render(items, seed_desc):
     import time
     L = [f"# arxiv daily paper · {time.strftime('%Y-%m-%d')}", "_按相关度排序_\n"]
-    for i, (score, c) in enumerate(scored[:top], 1):
-        zh = llm_translate(c["abstract"])
-        authors = llm_authors(c["id"], c.get("authors"))
-        L.append(f"### {i}. {c['title']}")
-        L.append(f"_{c['date']} · {c['cat']} · 相关度 {score:.3f}_")
-        if authors:
-            L.append(f"**作者**：{authors}")
+    for it in items:
+        c = it["c"]
+        L.append(f"### {it['i']}. {c['title']}")
+        L.append(f"_{c['date']} · {c['cat']} · 相关度 {it['score']:.3f}_")
+        if it["authors"]:
+            L.append(f"**作者**：{it['authors']}")
         L.append(f"— [{c['id']} (pdf)]({c['link']})")
         L.append("")
-        if zh:
-            L.append("**中文**：")
-            L.append(zh)
+        if it["zh"]:
+            L.append("**中文摘要**：")
+            L.append(it["zh"])
             L.append("")
-        L.append("**English**:")
-        L.append(c["abstract"])
-        L.append("")
-    L.append(f"\n---\n_arxiv_daily.py · 候选池 {len(scored)} 篇 → 取 top {top}_")
+    L.append(f"\n---\n_共 {len(items)} 篇_")
     return "\n".join(L)
 
 
@@ -357,24 +353,32 @@ def telegram_ingest(tok, fb_path, offset_path):
     return n
 
 
-def telegram_send(tok, chat_id, scored, top):
+def enrich(scored, top):
+    """每篇只算一次：中文翻译 + 作者(机构)。供 Telegram 和邮件复用，避免重复调 LLM。"""
+    items = []
+    for i, (score, c) in enumerate(scored[:top], 1):
+        items.append({"i": i, "score": score, "c": c,
+                      "zh": llm_translate(c["abstract"]),
+                      "authors": llm_authors(c["id"], c.get("authors"))})
+    return items
+
+
+def telegram_send(tok, chat_id, items):
     import time
     try:
         _tg("sendMessage", {"chat_id": chat_id,
-            "text": f"📚 arxiv daily paper · {time.strftime('%Y-%m-%d')} · 共 {min(top, len(scored))} 篇（点 👍/👎 调教推荐）"}, tok)
+            "text": f"📚 arxiv daily paper · {time.strftime('%Y-%m-%d')} · 共 {len(items)} 篇（点 👍/👎 调教推荐）"}, tok)
     except Exception as e:
         print(f"[warn] tg head: {e}", file=sys.stderr)
     sent = 0
-    for i, (score, c) in enumerate(scored[:top], 1):
-        zh = llm_translate(c["abstract"])
-        authors = llm_authors(c["id"], c.get("authors"))
-        parts = [f"{i}. {c['title']}", f"{c['date']} · {c['cat']} · 相关度 {score:.3f}"]
-        if authors:
-            parts.append(f"作者：{authors}")
+    for it in items:
+        c = it["c"]
+        parts = [f"{it['i']}. {c['title']}", f"{c['date']} · {c['cat']} · 相关度 {it['score']:.3f}"]
+        if it["authors"]:
+            parts.append(f"作者：{it['authors']}")
         parts.append(c["link"])
-        if zh:
-            parts.append(f"\n【中文】\n{zh}")
-        parts.append(f"\n【English】\n{c['abstract']}")
+        if it["zh"]:
+            parts.append(f"\n【中文摘要】\n{it['zh']}")
         text = "\n".join(parts)
         if len(text) > 4000:
             text = text[:3980] + " …"
@@ -419,20 +423,18 @@ def main():
     liked_texts = list(fetch_by_ids(liked_ids).values())
     disliked_texts = list(fetch_by_ids(disliked_ids).values())
     scored = rank(seed, cands, liked_texts, disliked_texts)
+    items = enrich(scored, a.top)   # 翻译+作者只算一次
 
-    delivered = False
     if tok and chat:
-        print(f"[ok] telegram sent {telegram_send(tok, chat, scored, a.top)}")
-        delivered = True
-    if not delivered:
-        md = render(scored, a.top, seed_desc)
-        if send_email("arxiv daily paper", md):
-            print("[ok] emailed digest")
-        if a.out:
-            open(a.out, "w").write(md)
-            print(f"[ok] written: {a.out}")
-        elif not os.environ.get("SMTP_SENDER_EMAIL"):
-            print(md)
+        print(f"[ok] telegram sent {telegram_send(tok, chat, items)}")
+    md = render(items, seed_desc)
+    if os.environ.get("SMTP_SENDER_EMAIL") and send_email("arxiv daily paper", md):
+        print("[ok] emailed digest")
+    if a.out:
+        open(a.out, "w").write(md)
+        print(f"[ok] written: {a.out}")
+    elif not (tok and chat) and not os.environ.get("SMTP_SENDER_EMAIL"):
+        print(md)
 
 
 if __name__ == "__main__":
