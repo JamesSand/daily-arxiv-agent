@@ -32,7 +32,7 @@ jobs:
           SMTP_APP_PASSWORD: ${{ secrets.SMTP_APP_PASSWORD }}
           DIGEST_RECIPIENT: ${{ secrets.DIGEST_RECIPIENT }}
         run: |
-          python arxiv_daily.py --cats cs.CL,cs.LG,cs.AI --pool 250 --top 12
+          python arxiv_daily.py --cats cs.CL,cs.LG,cs.AI --pool 250 --top 7
       - name: Persist feedback state
         run: |
           git config user.name "JamesSand"
