@@ -2,24 +2,28 @@
 """
 arxiv_daily.py — 每日 arXiv 论文推荐引擎。
 
-抓最近 arXiv 新论文 → 按与"兴趣种子"的相关度排序 → (可选)LLM 写 TL;DR → 输出 markdown / 发邮件。
+抓最近 arXiv 新论文 → 按与"兴趣种子"的相关度排序 → (可选)LLM 翻中文摘要 →
+发邮件 + 建 GitHub issue（每篇一条评论，对评论点 👍/👎 reaction 当反馈）。
 
 兴趣种子三选一(可叠加)：
   --seed-author "First Last"   用某研究者的 arXiv 论文(标题+摘要)当兴趣画像
   --notes /path/to/md_dir      读一个文件夹里的 .md 笔记当兴趣画像
   --keywords "LLM inference, quantization, ..."   关键词兜底
 
-排序：纯 Python TF-IDF 余弦（无需安装任何东西）。
+排序：纯 Python TF-IDF 余弦 + Rocchio 相关性反馈（无需安装任何东西）。
 
 环境变量(可选)：
-  LLM_API_KEY / LLM_BASE_URL / LLM_MODEL   设了就让 LLM 写 TL;DR
+  LLM_API_KEY / LLM_BASE_URL / LLM_MODEL   设了就让 LLM 翻译/摘要
+  GITHUB_TOKEN / GITHUB_REPOSITORY(或 GH_REPO)
+                                            设了就建 issue 推送 + 读评论 reaction 当 👍/👎 反馈
   SMTP_SENDER_EMAIL / SMTP_APP_PASSWORD / DIGEST_RECIPIENT / SMTP_HOST / SMTP_PORT
                                             设了就发邮件，否则写文件
 
 用法:
   python3 arxiv_daily.py --seed-author "First Last" --cats cs.CL,cs.LG,cs.AI --top 15 -o digest.md
+  python3 arxiv_daily.py --dry-run    # 不建 issue / 不发邮件，只打印将发布的内容
 """
-import argparse, glob, json, math, os, re, sys, urllib.parse, urllib.request
+import argparse, glob, json, math, os, re, sys, urllib.error, urllib.parse, urllib.request
 from collections import Counter
 from xml.etree import ElementTree as ET
 
@@ -270,9 +274,11 @@ def llm_authors(arxiv_id, fallback):
     return ", ".join(fallback) if fallback else ""
 
 
-def render(items, seed_desc):
+def render(items, seed_desc, issue_url=None):
     import time
     L = [f"# arxiv daily paper · {time.strftime('%Y-%m-%d')}", "_按相关度排序_\n"]
+    if issue_url:
+        L.append(f"👉 去这条 GitHub issue 给每篇点 👍/👎 调教推荐：{issue_url}\n")
     for it in items:
         c = it["c"]
         L.append(f"### {it['i']}. {c['title']}")
@@ -310,51 +316,82 @@ def send_email(subject, html_or_text):
     return True
 
 
-def _tg(method, payload, tok):
-    req = urllib.request.Request(f"https://api.telegram.org/bot{tok}/{method}",
-                                 data=json.dumps(payload).encode(),
-                                 headers={"Content-Type": "application/json"})
-    return json.loads(urllib.request.urlopen(req, timeout=30).read())
+# ── GitHub issue 反馈（替代 Telegram）：每篇一条评论，对评论点 👍/👎 reaction = 投票 ──
+GH_API = "https://api.github.com"
 
 
-def telegram_ingest(tok, fb_path, offset_path):
-    """把 getUpdates 里的 👍/👎 按钮点击写进 feedback.jsonl，并推进 offset。"""
-    off = 0
+def _gh(method, path, token, payload=None):
+    data = json.dumps(payload).encode() if payload is not None else None
+    req = urllib.request.Request(GH_API + path, data=data, method=method, headers={
+        "Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28", "Content-Type": "application/json", "User-Agent": UA})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        body = r.read()
+    return json.loads(body) if body else {}
+
+
+def _recorded_votes(path):
+    """读 feedback.jsonl → {base_id: 最新 vote}。用来只追加『新票/改票』、避免重复写。"""
+    latest = {}
     try:
-        off = int(open(offset_path).read().strip())
-    except Exception:
-        pass
-    try:
-        d = _tg("getUpdates", {"offset": off, "timeout": 0, "allowed_updates": ["callback_query"]}, tok)
-    except Exception as e:
-        print(f"[warn] tg getUpdates: {e}", file=sys.stderr)
-        return 0
-    n, last = 0, off
-    with open(fb_path, "a") as fb:
-        for u in d.get("result", []):
-            last = max(last, u["update_id"] + 1)
-            cq = u.get("callback_query")
-            if not cq:
+        for line in open(path):
+            line = line.strip()
+            if not line:
                 continue
-            v, _, pid = cq.get("data", "").partition(":")
-            vote = {"up": "up", "dn": "down"}.get(v)
-            if vote and pid:
-                fb.write(json.dumps({"id": pid, "vote": vote}) + "\n")
-                n += 1
-                try:
-                    _tg("answerCallbackQuery", {"callback_query_id": cq["id"],
-                        "text": "👍 已记录，会多推这类" if vote == "up" else "👎 已记录，会少推这类"}, tok)
-                except Exception:
-                    pass
-    if last != off:
-        open(offset_path, "w").write(str(last))
-    if n:
-        print(f"[info] ingested {n} telegram votes", file=sys.stderr)
-    return n
+            try:
+                o = json.loads(line)
+            except Exception:
+                continue
+            b = re.sub(r"v\d+$", "", o.get("id", ""))
+            if b and o.get("vote") in ("up", "down"):
+                latest[b] = o["vote"]
+    except FileNotFoundError:
+        pass
+    return latest
+
+
+def github_ingest(token, repo, fb_path):
+    """读 arxiv-digest issue 各条评论的 👍/👎 reaction，写进 feedback.jsonl（只追加新票/改票）。"""
+    try:
+        issues = _gh("GET", f"/repos/{repo}/issues?labels=arxiv-digest&state=all"
+                            "&per_page=30&sort=created&direction=desc", token)
+    except Exception as e:
+        print(f"[warn] gh list issues: {e}", file=sys.stderr)
+        return 0
+    recorded = _recorded_votes(fb_path)
+    new = []
+    for iss in issues:
+        if not iss.get("comments"):
+            continue
+        try:
+            comments = _gh("GET", f"/repos/{repo}/issues/{iss['number']}/comments?per_page=100", token)
+        except Exception as e:
+            print(f"[warn] gh comments #{iss.get('number')}: {e}", file=sys.stderr)
+            continue
+        for cm in comments:
+            m = re.search(r"<!-- paper:(\S+) -->", cm.get("body", ""))
+            if not m:
+                continue
+            pid = m.group(1)
+            rx = cm.get("reactions", {}) or {}
+            up, dn = rx.get("+1", 0), rx.get("-1", 0)
+            vote = "up" if up > dn else ("down" if dn > up else None)
+            if not vote:
+                continue
+            base = re.sub(r"v\d+$", "", pid)
+            if recorded.get(base) != vote:
+                new.append({"id": pid, "vote": vote})
+                recorded[base] = vote
+    if new:
+        with open(fb_path, "a") as f:
+            for o in new:
+                f.write(json.dumps(o) + "\n")
+        print(f"[info] ingested {len(new)} github votes", file=sys.stderr)
+    return len(new)
 
 
 def enrich(scored, top):
-    """每篇只算一次：中文翻译 + 作者(机构)。供 Telegram 和邮件复用，避免重复调 LLM。"""
+    """每篇只算一次：中文翻译 + 作者(机构)。供 issue 评论和邮件复用，避免重复调 LLM。"""
     items = []
     for i, (score, c) in enumerate(scored[:top], 1):
         items.append({"i": i, "score": score, "c": c,
@@ -363,37 +400,54 @@ def enrich(scored, top):
     return items
 
 
-def telegram_send(tok, chat_id, items):
-    import time
+def _comment_body(it):
+    c = it["c"]
+    L = [f"### {it['i']}. {c['title']}", f"*{c['date']} · {c['cat']} · 相关度 {it['score']:.3f}*"]
+    if it["authors"]:
+        L.append(f"**作者**：{it['authors']}")
+    L.append(f"[{c['id']} (pdf)]({c['link']})")
+    if it["zh"]:
+        L += ["", "**中文摘要**：", it["zh"]]
+    L += ["", f"<!-- paper:{c['id']} -->", "_对本条评论点 👍 = 多推这类 · 👎 = 少推这类_"]
+    return "\n".join(L)
+
+
+def github_send(token, repo, items, date, dry_run=False):
+    """建当天的 issue + 每篇论文一条评论（评论里埋 <!-- paper:id --> 供回收 reaction）。返回 issue url。"""
+    title = f"📚 arxiv daily · {date} · {len(items)} 篇"
+    body = ("给每条**评论**点 👍(喜欢) / 👎(不要) 来调教推荐——已投票的论文不再出现。\n\n"
+            + "\n".join(f"- {it['i']}. {it['c']['title']}" for it in items))
+    if dry_run:
+        print(f"[dry-run] issue: {title}\n{body}\n", file=sys.stderr)
+        for it in items:
+            print("--- comment ---\n" + _comment_body(it) + "\n", file=sys.stderr)
+        return None
     try:
-        _tg("sendMessage", {"chat_id": chat_id,
-            "text": f"📚 arxiv daily paper · {time.strftime('%Y-%m-%d')} · 共 {len(items)} 篇（点 👍/👎 调教推荐）"}, tok)
+        _gh("POST", f"/repos/{repo}/labels", token,
+            {"name": "arxiv-digest", "color": "0e8a16", "description": "daily arxiv digest"})
+    except urllib.error.HTTPError as e:
+        if e.code != 422:  # 422 = 标签已存在
+            print(f"[warn] ensure label: {e}", file=sys.stderr)
     except Exception as e:
-        print(f"[warn] tg head: {e}", file=sys.stderr)
-    sent = 0
+        print(f"[warn] ensure label: {e}", file=sys.stderr)
+    try:
+        issue = _gh("POST", f"/repos/{repo}/issues", token,
+                    {"title": title, "body": body, "labels": ["arxiv-digest"]})
+    except Exception as e:
+        print(f"[warn] create issue: {e}", file=sys.stderr)
+        return None
+    num = issue["number"]
     for it in items:
-        c = it["c"]
-        parts = [f"{it['i']}. {c['title']}", f"{c['date']} · {c['cat']} · 相关度 {it['score']:.3f}"]
-        if it["authors"]:
-            parts.append(f"作者：{it['authors']}")
-        parts.append(c["link"])
-        if it["zh"]:
-            parts.append(f"\n【中文摘要】\n{it['zh']}")
-        text = "\n".join(parts)
-        if len(text) > 4000:
-            text = text[:3980] + " …"
-        kb = {"inline_keyboard": [[{"text": "👍 喜欢", "callback_data": f"up:{c['id']}"},
-                                   {"text": "👎 不要", "callback_data": f"dn:{c['id']}"}]]}
         try:
-            _tg("sendMessage", {"chat_id": chat_id, "text": text, "reply_markup": kb,
-                                "disable_web_page_preview": True}, tok)
-            sent += 1
+            _gh("POST", f"/repos/{repo}/issues/{num}/comments", token, {"body": _comment_body(it)})
         except Exception as e:
-            print(f"[warn] tg send {c['id']}: {e}", file=sys.stderr)
-    return sent
+            print(f"[warn] comment {it['c']['id']}: {e}", file=sys.stderr)
+    print(f"[ok] github issue #{num} · {len(items)} papers", file=sys.stderr)
+    return issue.get("html_url")
 
 
 def main():
+    import time
     ap = argparse.ArgumentParser()
     ap.add_argument("--seed-author", default=os.environ.get("SEED_AUTHOR"))
     ap.add_argument("--notes", default=os.environ.get("MD_NOTES_PATH"))
@@ -403,6 +457,8 @@ def main():
     ap.add_argument("--top", type=int, default=int(os.environ.get("PAPERS_PER_DAY", "15")))
     ap.add_argument("-o", "--out", default=None)
     ap.add_argument("--feedback", default=os.environ.get("FEEDBACK_FILE"))
+    ap.add_argument("--dry-run", action="store_true",
+                    help="不建 issue / 不发邮件，只打印（含将发布的 issue 内容）")
     a = ap.parse_args()
 
     cats = [c for c in a.cats.split(",") if c]
@@ -410,10 +466,10 @@ def main():
     seed_desc = a.seed_author or a.notes or (a.keywords or "")[:50]
     here = os.path.dirname(os.path.abspath(__file__))
     fb_path = a.feedback or os.path.join(here, "feedback.jsonl")
-    tok = os.environ.get("TELEGRAM_BOT_TOKEN")
-    chat = os.environ.get("TELEGRAM_CHAT_ID")
-    if tok:
-        telegram_ingest(tok, fb_path, os.path.join(here, "tg_offset.txt"))  # 先收上一轮的 👍/👎
+    gh_token = os.environ.get("GITHUB_TOKEN")
+    gh_repo = os.environ.get("GITHUB_REPOSITORY") or os.environ.get("GH_REPO")
+    if gh_token and gh_repo and not a.dry_run:
+        github_ingest(gh_token, gh_repo, fb_path)  # 先收上一轮的 👍/👎（issue 评论 reaction）
     cands = fetch_candidates(cats, a.pool)
     print(f"[info] fetched {len(cands)} candidates from {cats}", file=sys.stderr)
     liked_ids, disliked_ids, voted_bases = load_feedback(fb_path)
@@ -425,15 +481,16 @@ def main():
     scored = rank(seed, cands, liked_texts, disliked_texts)
     items = enrich(scored, a.top)   # 翻译+作者只算一次
 
-    if tok and chat:
-        print(f"[ok] telegram sent {telegram_send(tok, chat, items)}")
-    md = render(items, seed_desc)
-    if os.environ.get("SMTP_SENDER_EMAIL") and send_email("arxiv daily paper", md):
+    issue_url = None
+    if gh_token and gh_repo:
+        issue_url = github_send(gh_token, gh_repo, items, time.strftime('%Y-%m-%d'), dry_run=a.dry_run)
+    md = render(items, seed_desc, issue_url)
+    if not a.dry_run and os.environ.get("SMTP_SENDER_EMAIL") and send_email("arxiv daily paper", md):
         print("[ok] emailed digest")
     if a.out:
         open(a.out, "w").write(md)
         print(f"[ok] written: {a.out}")
-    elif not (tok and chat) and not os.environ.get("SMTP_SENDER_EMAIL"):
+    elif a.dry_run or (not os.environ.get("SMTP_SENDER_EMAIL") and not (gh_token and gh_repo)):
         print(md)
 
 

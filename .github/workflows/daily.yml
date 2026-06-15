@@ -8,7 +8,8 @@ on:
   workflow_dispatch: {}   # 手动触发
 
 permissions:
-  contents: write          # 需要把 feedback.jsonl / tg_offset.txt commit 回来
+  contents: write          # 把 feedback.jsonl commit 回来
+  issues: write            # 建 digest issue + 评论、读评论 reaction 当反馈
 
 jobs:
   digest:
@@ -20,14 +21,14 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -r requirements.txt
-      - name: Ingest 👍/👎 + rank + send to Telegram
+      - name: Ingest 👍/👎 (issue reactions) + rank + email + post issue
         env:
           LLM_PROVIDER: ${{ secrets.LLM_PROVIDER }}
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
           LLM_MODEL: claude-opus-4-8
           SEED_AUTHOR: ${{ secrets.SEED_AUTHOR }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # 自动注入，权限见上面 permissions
+          # GITHUB_REPOSITORY 由 Actions 运行环境自动提供（owner/repo）
           SMTP_SENDER_EMAIL: ${{ secrets.SMTP_SENDER_EMAIL }}
           SMTP_APP_PASSWORD: ${{ secrets.SMTP_APP_PASSWORD }}
           DIGEST_RECIPIENT: ${{ secrets.DIGEST_RECIPIENT }}
@@ -37,6 +38,6 @@ jobs:
         run: |
           git config user.name "JamesSand"
           git config user.email "zhizhousha@together.ai"
-          touch feedback.jsonl tg_offset.txt
-          git add feedback.jsonl tg_offset.txt
+          touch feedback.jsonl
+          git add feedback.jsonl
           git diff --cached --quiet || (git commit -m "update feedback state [skip ci]" && git push)
